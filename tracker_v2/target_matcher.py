@@ -95,24 +95,40 @@ class TargetMatcher:
         if not self.bank.is_loaded():
             return None
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # 降采样搜索: 先在半分辨率上找粗位置，大幅减少耗时
+        h, w = frame.shape[:2]
+        small = cv2.resize(frame, (w // 2, h // 2))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
         best_result = None
         best_score = 0.0
 
+        # 只用3个关键尺度，不遍历全部
+        search_scales = [0.5, 0.75, 1.0]
+
         for template in self.bank.templates:
-            for scale, tmpl_gray in template['multi_scale'].items():
+            for scale in search_scales:
+                if scale not in template['multi_scale']:
+                    continue
+                tmpl_gray = template['multi_scale'][scale]
+                # 模板也降采样一半
                 th, tw = tmpl_gray.shape[:2]
-                # 跳过比帧还大的模板
-                if tw >= gray.shape[1] or th >= gray.shape[0]:
+                stw, sth = tw // 2, th // 2
+                if stw < 4 or sth < 4:
+                    continue
+                small_tmpl = cv2.resize(tmpl_gray, (stw, sth))
+
+                if stw >= gray.shape[1] or sth >= gray.shape[0]:
                     continue
 
-                result = cv2.matchTemplate(gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                result = cv2.matchTemplate(gray, small_tmpl, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
                 if max_val > best_score:
                     best_score = max_val
                     mx, my = max_loc
-                    best_result = (mx, my, mx + tw, my + th, max_val)
+                    # 坐标映射回原分辨率
+                    best_result = (mx * 2, my * 2, mx * 2 + tw, my * 2 + th, max_val)
 
         if best_result and best_score > 0.5:
             return best_result
