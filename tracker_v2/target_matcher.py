@@ -38,13 +38,15 @@ class TargetMatcher:
         # 提取候选目标的特征
         color_score = self._best_color_match(crop)
         shape_score = self._best_shape_match(crop)
+        texture_score = self._best_orb_match(crop)
 
-        # 综合评分
-        score = (WEIGHT_COLOR * color_score +
-                 WEIGHT_SHAPE * shape_score +
-                 WEIGHT_YOLO * yolo_conf)
+        # 综合评分 (颜色0.3 + 形状0.2 + 纹理0.3 + YOLO0.2)
+        score = (0.30 * color_score +
+                 0.20 * shape_score +
+                 0.30 * texture_score +
+                 0.20 * yolo_conf)
 
-        return score, 0  # 简化: 返回最佳模板index
+        return score, 0
 
     def match_detections(self, frame, detections, threshold=None):
         """
