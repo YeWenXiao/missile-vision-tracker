@@ -7,3 +7,5 @@ max.png
 debug_frames*/
 video_frames/
 yolov5nu.pt
+auto_sync.sh
+sync_log.txt
