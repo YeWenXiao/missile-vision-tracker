@@ -10,6 +10,10 @@ from config import (
     HSV_HIST_SIZE, HSV_RANGES, TEMPLATE_SCALES,
 )
 
+# ORB特征检测器(全局复用)
+_orb = cv2.ORB_create(nfeatures=200)
+_bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
 
 class TargetMatcher:
     """多特征融合目标匹配"""
