@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 gen_doc.py
 tracker_output.avi
+rk3588_output.avi
+max.png
 debug_frames*/
 video_frames/
 yolov5nu.pt

@@ -435,6 +435,9 @@ class Scanner:
 # ============================================================================
 
 def main():
+    # 检测是否有GUI显示环境
+    has_display = os.environ.get('DISPLAY') is not None or sys.platform == 'win32'
+
     parser = argparse.ArgumentParser(description='YOLO检测 + 云台追踪 + Zoom')
     parser.add_argument('--camera_ip', default='192.168.144.25')
     parser.add_argument('--rtsp_url', default=None)
@@ -514,6 +517,7 @@ def main():
     track_count = 0
     last_det = None
     last_det_conf = 0.0
+    last_detect_time = 0  # 上次检测到目标的时间戳
 
     # 非阻塞zoom计时器: zoom_out操作开始时间，0表示没有进行中的zoom_out
     zoom_out_start = 0
@@ -530,6 +534,16 @@ def main():
     lost_vel = [0.0, 0.0]         # 丢失时的速度方向
     lost_last_err = [0.0, 0.0]    # 丢失时目标偏离中心的方向
 
+    # === 目标尺寸趋势追踪（预测性zoom） ===
+    size_ema = 0.0                 # 目标尺寸EMA (box_ratio)
+    size_ema_slow = 0.0            # 慢速EMA，用于趋势比较
+    size_ema_alpha = 0.3           # 快速EMA平滑系数
+    size_ema_slow_alpha = 0.08     # 慢速EMA平滑系数
+    size_initialized = False       # 尺寸EMA是否已初始化
+    shrink_zoom_active = False     # 预测性zoom是否正在进行
+    shrink_zoom_start = 0          # 预测性zoom开始时间
+    shrink_consec = 0              # 连续缩小帧计数
+
     fps = 0.0
     fps_count = 0
     fps_time = time.time()
@@ -538,7 +552,7 @@ def main():
     last_submit_frame = 0  # 上次提交检测的帧号
 
     def do_center():
-        nonlocal state, lost_count, track_count, last_det, zooming_in, zoom_out_start, zoom_out_duration
+        nonlocal state, lost_count, track_count, last_det, zooming_in, zoom_out_start, zoom_out_duration, shrink_zoom_active, shrink_consec, size_initialized
         state = STATE_SCAN
         lost_count = 0
         track_count = 0
@@ -550,6 +564,9 @@ def main():
             gimbal.zoom_out()
             zoom_out_start = time.time()
             zoom_out_duration = 4.0
+        shrink_zoom_active = False
+        shrink_consec = 0
+        size_initialized = False
         if scanner:
             scanner.resume()
         yaw_pid.reset()
@@ -557,7 +574,7 @@ def main():
         return '云台已回中'
 
     def do_rescan():
-        nonlocal state, lost_count, track_count, last_det, zooming_in, zoom_out_start, zoom_out_duration
+        nonlocal state, lost_count, track_count, last_det, zooming_in, zoom_out_start, zoom_out_duration, shrink_zoom_active, shrink_consec, size_initialized
         state = STATE_SCAN
         lost_count = 0
         track_count = 0
@@ -568,6 +585,9 @@ def main():
             gimbal.zoom_out()
             zoom_out_start = time.time()
             zoom_out_duration = 4.0
+        shrink_zoom_active = False
+        shrink_consec = 0
+        size_initialized = False
         if scanner:
             scanner.resume()
         yaw_pid.reset()
@@ -728,7 +748,9 @@ def main():
 
                     if det_box is not None:
                         # === 刚从丢失状态找回目标 ===
-                        was_lost = lost_count > 10
+                        # 用时间判断是否真的丢失过(>3秒)，避免异步检测延迟误触发
+                        was_lost = last_detect_time > 0 and (now - last_detect_time) > 3.0
+                        last_detect_time = now
                         lost_count = 0
                         track_count += 1
 
@@ -790,7 +812,7 @@ def main():
                     else:
                         # 本帧没有新检测 → 用记忆PID控制
                         lost_count += 1
-                        if lost_count < 10:
+                        if lost_count < 30:  # 异步模式下检测间隔较长，加大容忍
                             yaw_speed = yaw_pid.compute(err_x, dt) if abs(err_x) > 0.03 else 0
                             pitch_speed = pitch_pid.compute(err_y, dt) if abs(err_y) > 0.03 else 0
                             predict_gain = 40 * approach_scale
@@ -811,12 +833,28 @@ def main():
                                 else:
                                     gimbal.set_speed(0, 0)
 
-                    # ==================== 智能zoom管理 ====================
+                    # ==================== 智能zoom管理（含预测性zoom）====================
                     if not args.no_zoom and gimbal and det_box is not None:
                         box_w = x2 - x1
                         box_h = y2 - y1
                         box_ratio = max(box_w / w, box_h / h)
                         vel_magnitude = (velocity[0]**2 + velocity[1]**2)**0.5
+
+                        # --- 更新目标尺寸趋势EMA ---
+                        if not size_initialized:
+                            size_ema = box_ratio
+                            size_ema_slow = box_ratio
+                            size_initialized = True
+                        else:
+                            size_ema = size_ema_alpha * box_ratio + (1 - size_ema_alpha) * size_ema
+                            size_ema_slow = size_ema_slow_alpha * box_ratio + (1 - size_ema_slow_alpha) * size_ema_slow
+
+                        # 缩小趋势检测：快速EMA低于慢速EMA说明目标正在变小
+                        is_shrinking = size_ema < size_ema_slow * 0.92
+                        if is_shrinking:
+                            shrink_consec += 1
+                        else:
+                            shrink_consec = max(0, shrink_consec - 2)
 
                         if zooming_in:
                             # 正在zoom — 每0.5秒暂停一次让PID居中
@@ -824,8 +862,8 @@ def main():
                                 gimbal.zoom_stop()
                                 zooming_in = False
                                 zoom_pause_time = now
-                            # 最大zoom 6秒
-                            if now - zoom_first_time > 6.0:
+                            # 最大zoom 8秒（延长以支持持续追踪）
+                            if now - zoom_first_time > 8.0:
                                 gimbal.zoom_stop()
                                 zooming_in = False
                                 print(f'[Zoom] 达到最大zoom')
@@ -834,22 +872,63 @@ def main():
                                 gimbal.zoom_stop()
                                 zooming_in = False
                                 zoom_first_time = 0
+                                shrink_zoom_active = False
                                 print(f'[Zoom] 目标足够大({box_ratio:.0%})，停止zoom')
-                        else:
-                            # 没在zoom — 满足条件就zoom放大一点
-                            center_ok = abs(err_x) < 0.10 and abs(err_y) < 0.10
-                            size_small = box_ratio < 0.15  # 目标较小时zoom
-                            cooldown_ok = now - zoom_pause_time > 2.0
-                            stable = track_count > 15
-                            not_fast = vel_magnitude < 0.010
 
-                            if size_small and center_ok and cooldown_ok and stable and not_fast:
+                        elif shrink_zoom_active:
+                            # 预测性zoom进行中 — 持续zoom直到目标稳定或变大
+                            if size_ema >= size_ema_slow * 0.97 or box_ratio > 0.15:
+                                # 目标尺寸稳定或恢复，停止预测性zoom
+                                shrink_zoom_active = False
+                                shrink_consec = 0
+                                zoom_pause_time = now
+                                print(f'[Zoom] 目标尺寸稳定({box_ratio:.0%})，停止预测性zoom')
+                            elif now - shrink_zoom_start > 6.0:
+                                shrink_zoom_active = False
+                                shrink_consec = 0
+                                print(f'[Zoom] 预测性zoom超时')
+                            else:
+                                # 继续脉冲式zoom-in（0.4秒zoom + 0.3秒停）
+                                cycle_pos = (now - shrink_zoom_start) % 0.7
+                                if cycle_pos < 0.4:
+                                    if not zooming_in:
+                                        zooming_in = True
+                                        gimbal.zoom_in()
+                                        zoom_start_time = now
+                                        if zoom_first_time == 0:
+                                            zoom_first_time = now
+                                else:
+                                    if zooming_in:
+                                        gimbal.zoom_stop()
+                                        zooming_in = False
+
+                        else:
+                            cooldown_ok = now - zoom_pause_time > 1.5
+
+                            # === 模式1: 预测性zoom — 目标正在缩小，主动zoom追踪 ===
+                            if (shrink_consec >= 5 and box_ratio < 0.18 and
+                                    cooldown_ok and track_count > 8 and
+                                    abs(err_x) < 0.25 and abs(err_y) < 0.25):
+                                shrink_zoom_active = True
+                                shrink_zoom_start = now
                                 zooming_in = True
                                 gimbal.zoom_in()
                                 zoom_start_time = now
                                 if zoom_first_time == 0:
                                     zoom_first_time = now
-                                print(f'[Zoom] 目标居中({box_ratio:.0%})，zoom放大')
+                                print(f'[Zoom] 检测到目标缩小趋势({size_ema:.3f}<{size_ema_slow:.3f})，预测性zoom')
+
+                            # === 模式2: 常规zoom — 目标已小且稳定居中 ===
+                            elif (box_ratio < 0.12 and
+                                    abs(err_x) < 0.10 and abs(err_y) < 0.10 and
+                                    cooldown_ok and track_count > 15 and
+                                    vel_magnitude < 0.010):
+                                zooming_in = True
+                                gimbal.zoom_in()
+                                zoom_start_time = now
+                                if zoom_first_time == 0:
+                                    zoom_first_time = now
+                                print(f'[Zoom] 目标居中且小({box_ratio:.0%})，zoom放大')
 
                     # 打印追踪信息（每秒一次）
                     if fps_count == 0:
@@ -857,13 +936,14 @@ def main():
                         box_w = x2 - x1
                         box_h = y2 - y1
                         box_pct = max(box_w / w, box_h / h)
-                        zoom_str = ' ZOOM+' if zooming_in else ''
+                        zoom_str = ' ZOOM+' if zooming_in else (' PRED-ZOOM' if shrink_zoom_active else '')
                         vel_mag = (velocity[0]**2 + velocity[1]**2)**0.5
                         a_scale = max(0.3, min(1.0, 1.0 - box_pct * 2.0))
+                        shrink_str = f' shrink:{shrink_consec}' if shrink_consec > 0 else ''
                         print(f'[追踪] conf:{last_det_conf:.2f} '
                               f'err:({err_x:+.2f},{err_y:+.2f}) '
                               f'size:{box_pct:.0%} spd:{a_scale:.1f}x{zoom_str} '
-                              f'vel:{vel_mag:.3f}{marker}')
+                              f'vel:{vel_mag:.3f}{shrink_str}{marker}')
 
                 else:
                     # ==================== 目标丢失 ====================
@@ -884,12 +964,15 @@ def main():
                         if zooming_in:
                             gimbal.zoom_stop()
                             zooming_in = False
+                        shrink_zoom_active = False
+                        shrink_consec = 0
+                        size_initialized = False
                         if zoom_out_start == 0:
                             gimbal.zoom_out()
                             zoom_out_start = now
-                            zoom_out_duration = 1.5
+                            zoom_out_duration = 2.5  # 更长的缩回时间确保视野扩大
                         zoom_first_time = 0
-                        print(f'[搜索] 丢失! zoom缩回, 沿消失方向追踪')
+                        print(f'[搜索] 丢失! zoom缩回搜索, 沿消失方向追踪')
 
                     # --- 阶段1: 1~30帧 — 沿消失方向追踪 ---
                     if 1 <= lost_count <= 30 and gimbal:
@@ -952,6 +1035,9 @@ def main():
                         last_pitch_speed = 0.0
                         zooming_in = False
                         zoom_first_time = 0
+                        shrink_zoom_active = False
+                        shrink_consec = 0
+                        size_initialized = False
                         if gimbal:
                             gimbal.stop()
                             if zoom_out_start == 0:
@@ -998,7 +1084,9 @@ def main():
                 status_color = (200, 200, 200)
 
             status_text = f'{state}'
-            if zooming_in:
+            if shrink_zoom_active:
+                status_text += ' PRED-ZOOM'
+            elif zooming_in:
                 status_text += ' ZOOM+'
             if state == STATE_TRACK and lost_count > 0:
                 status_text += f' lost:{lost_count}'
@@ -1014,13 +1102,14 @@ def main():
                 video_writer = cv2.VideoWriter(save_path, fourcc, 15.0, (w, h))
             video_writer.write(vis)
 
-            # 本地显示（Windows有GUI）
-            if total_frames == 1:
-                cv2.namedWindow('Tracker', cv2.WINDOW_NORMAL)
-            cv2.imshow('Tracker', vis)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
+            # 本地显示（仅在有GUI环境时）
+            if has_display:
+                if total_frames == 1:
+                    cv2.namedWindow('Tracker', cv2.WINDOW_NORMAL)
+                cv2.imshow('Tracker', vis)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
 
     except KeyboardInterrupt:
         print('\n[系统] 用户退出')
@@ -1035,7 +1124,8 @@ def main():
             gimbal.zoom_stop()
             gimbal.close()
         web.stop()
-        cv2.destroyAllWindows()
+        if has_display:
+            cv2.destroyAllWindows()
         print('[系统] 已退出')
 
 
