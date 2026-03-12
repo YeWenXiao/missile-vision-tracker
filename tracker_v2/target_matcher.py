@@ -164,9 +164,43 @@ class TargetMatcher:
 
         best = 0.0
         for tmpl_hu in self.bank.get_hu_moments():
-            # 欧氏距离，转换为相似度
+            # 欧氏距离，加大衰减增强区分度
             dist = np.linalg.norm(hu - tmpl_hu)
-            score = 1.0 / (1.0 + dist * 0.1)
+            score = 1.0 / (1.0 + dist * 0.5)
+            best = max(best, score)
+
+        return best
+
+    def _best_orb_match(self, crop):
+        """ORB特征点匹配 — 纹理级区分，对非目标区分度高"""
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # 统一大小避免特征点数量差异
+        gray = cv2.resize(gray, (128, 128))
+        kp1, des1 = _orb.detectAndCompute(gray, None)
+
+        if des1 is None or len(des1) < 5:
+            return 0.0
+
+        best = 0.0
+        for tmpl in self.bank.templates:
+            tmpl_gray = cv2.cvtColor(tmpl['image'], cv2.COLOR_BGR2GRAY)
+            tmpl_gray = cv2.resize(tmpl_gray, (128, 128))
+            kp2, des2 = _orb.detectAndCompute(tmpl_gray, None)
+
+            if des2 is None or len(des2) < 5:
+                continue
+
+            matches = _bf.match(des1, des2)
+            if not matches:
+                continue
+
+            # 取前20个最佳匹配的距离
+            matches = sorted(matches, key=lambda m: m.distance)
+            top_n = min(20, len(matches))
+            avg_dist = sum(m.distance for m in matches[:top_n]) / top_n
+
+            # 距离转相似度 (ORB距离范围0-256)
+            score = max(0.0, 1.0 - avg_dist / 120.0)
             best = max(best, score)
 
         return best
