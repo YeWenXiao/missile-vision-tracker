@@ -34,8 +34,8 @@ WEIGHT_SHAPE = 0.3
 WEIGHT_YOLO = 0.2
 
 # 匹配阈值
-MATCH_THRESHOLD = 0.45          # 搜索阶段确认目标
-VERIFY_THRESHOLD = 0.30         # 追踪阶段持续验证
+MATCH_THRESHOLD = 0.55          # 搜索阶段确认目标
+VERIFY_THRESHOLD = 0.35         # 追踪阶段持续验证
 VERIFY_INTERVAL = 1.0           # 验证间隔(秒)
 
 # HSV直方图参数
