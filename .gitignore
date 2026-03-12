@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 gen_doc.py
+tracker_output.avi
+debug_frames*/
+video_frames/
+yolov5nu.pt
