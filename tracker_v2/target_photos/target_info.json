@@ -1,0 +1,5 @@
+{
+    "description": "目标照片集模板 — 替换为实际目标照片",
+    "crops": {},
+    "notes": "将目标照片放入此目录，命名如 far_01.jpg, mid_01.jpg, near_01.jpg。如果需要裁剪，在crops中添加 {filename: [x1,y1,x2,y2]}"
+}
